@@ -1,7 +1,7 @@
 # network.py — LAN multiplayer networking layer
 # HOST is authoritative for ALL game state (enemies, kills, elapsed time).
-# Clients send: position snapshots + bullet-hit events.
-# Host sends:   full game state (enemy list, positions, kills, elapsed).
+# Clients send: position snapshots + bullet data + hit events.
+# Host sends:   full game state (enemies, all player positions, ALL bullets, kills).
 
 import socket
 import threading
@@ -32,7 +32,7 @@ def _recv_lines(sock, buf: list) -> list:
     messages = []
     try:
         sock.setblocking(False)
-        chunk = sock.recv(32768)
+        chunk = sock.recv(65536)
         if chunk:
             buf.append(chunk.decode(errors="replace"))
     except BlockingIOError:
@@ -63,7 +63,7 @@ def _recv_lines(sock, buf: list) -> list:
 class LANServer:
     def __init__(self, host_username: str):
         self.host_username = host_username
-        self._clients: dict = {}   # slot -> {sock, buf, username, kills, last_seen, pos}
+        self._clients: dict = {}  # slot -> {sock, buf, username, kills, last_seen, pos, bullets}
         self._lock    = threading.Lock()
         self._events  = []
         self._running = True
@@ -106,9 +106,16 @@ class LANServer:
                     for s, c in self._clients.items()]
 
     def get_client_positions(self) -> dict:
+        """Returns {slot: pos_dict} for all connected clients."""
         with self._lock:
             return {slot: cl["pos"] for slot, cl in self._clients.items()
                     if cl.get("pos")}
+
+    def get_client_bullets(self) -> dict:
+        """Returns {slot: [bullet_dict, ...]} for all connected clients."""
+        with self._lock:
+            return {slot: list(cl.get("bullets", []))
+                    for slot, cl in self._clients.items()}
 
     def broadcast_restart_countdown(self, secs: int):
         msg = {"type": "state", "data": {"type": "restart_countdown", "secs": secs}}
@@ -119,6 +126,14 @@ class LANServer:
 
     def broadcast_restart(self):
         msg = {"type": "state", "data": {"type": "restart"}}
+        with self._lock:
+            for cl in self._clients.values():
+                try: _send(cl["sock"], msg)
+                except Exception: pass
+
+    def send_respawn(self, slot: int):
+        """Tell all clients that the given slot should respawn now."""
+        msg = {"type": "state", "data": {"type": "respawn", "slot": slot}}
         with self._lock:
             for cl in self._clients.values():
                 try: _send(cl["sock"], msg)
@@ -145,7 +160,8 @@ class LANServer:
                     self._next_slot += 1
                     self._clients[slot] = {
                         "sock": conn, "buf": [], "username": f"Player{slot}",
-                        "kills": 0, "last_seen": time.time(), "pos": None,
+                        "kills": 0, "last_seen": time.time(),
+                        "pos": None, "bullets": [],
                     }
                 _send(conn, {"type": "assign", "slot": slot})
                 threading.Thread(target=self._client_handshake,
@@ -167,13 +183,15 @@ class LANServer:
                     if m.get("type") == "hello":
                         with self._lock:
                             if slot in self._clients:
-                                self._clients[slot]["username"] = m.get("username", f"Player{slot}")[:16]
+                                self._clients[slot]["username"] = \
+                                    m.get("username", f"Player{slot}")[:16]
                         self._broadcast_lobby_update()
                         return
         except Exception:
             pass
 
     def _broadcast_lobby_update(self):
+        """Tell all connected clients who is currently in the lobby."""
         with self._lock:
             players_list = [{"slot": s, "username": c["username"]}
                             for s, c in self._clients.items()]
@@ -196,19 +214,24 @@ class LANServer:
                     cl["last_seen"] = time.time()
                     mtype = m.get("type")
                     if mtype == "hit":
-                        # Client bullet hit — forward as event for host to process
                         self._events.append({"type": "hit", "slot": slot,
                                              "eid": m.get("eid", -1)})
                     elif mtype == "pos":
                         with self._lock:
                             if slot in self._clients:
                                 self._clients[slot]["pos"] = {
-                                    "x": m.get("x", 0), "y": m.get("y", 0),
-                                    "angle": m.get("angle", 0),
-                                    "moving": m.get("moving", False),
+                                    "x":       m.get("x", 0),
+                                    "y":       m.get("y", 0),
+                                    "angle":   m.get("angle", 0),
+                                    "moving":  m.get("moving", False),
                                     "is_dead": m.get("is_dead", False),
                                     "username": self._clients[slot]["username"],
                                 }
+                    elif mtype == "bullets":
+                        # Client sends list of its active bullets each tick
+                        with self._lock:
+                            if slot in self._clients:
+                                self._clients[slot]["bullets"] = m.get("list", [])
                     elif mtype == "ping":
                         _send(cl["sock"], {"type": "pong"})
                 if time.time() - cl.get("last_seen", 0) > LAN_TIMEOUT:
@@ -258,6 +281,10 @@ class LANClient:
 
     def send_pos(self, state: dict):
         _send(self._sock, {"type": "pos", **state})
+
+    def send_bullets(self, bullet_list: list):
+        """Send list of active bullet dicts {bid, x, y, vx, vy} to host."""
+        _send(self._sock, {"type": "bullets", "list": bullet_list})
 
     def get_state(self):
         with self._lock:
