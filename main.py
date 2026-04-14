@@ -1,25 +1,51 @@
 # main.py — Game loop & state manager
 # Run locally:  python src/main.py
 # Web build:    pygbag src/main.py
+#
+# Changes in this version:
+#   - map.png in assets/ used as ground texture (auto-scaled, fallback grid)
+#   - LAN: client players see correct live kill scores from host broadcast
+#   - LAN: Game Over screen only appears when ALL players are dead
+#   - LAN: dead players enter spectator mode, watch the others
+#   - LAN: 30-second respawn timer shown next to dead player name in HUD
+#   - LAN: After 30s (if any player alive), dead player respawns at center with
+#           RESPAWN_LIVES HP and RESPAWN_IFRAMES seconds of invulnerability
+#   - Individual player scores always visible ingame + total in bold red
 
 import asyncio
 import pygame
 import sys
 import os
-import time
+import math
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from constants import *
-from player    import Player, RemotePlayer
+from player    import Player, RemotePlayer, RemoteBullet
 from enemy     import EnemyManager
 from ui        import UI
 from audio     import SoundManager
 from network   import LANServer, LANClient, get_local_ip
 
 
+# ── Background ─────────────────────────────────────────────────────────
+
 def _make_arena_bg():
+    """Load map.png from assets/ if it exists, else draw a procedural grid."""
     surf = pygame.Surface((SCREEN_W, SCREEN_H))
+
+    if os.path.isfile(MAP_IMG_PATH):
+        try:
+            img = pygame.image.load(MAP_IMG_PATH).convert()
+            img = pygame.transform.scale(img, (SCREEN_W, SCREEN_H))
+            surf.blit(img, (0, 0))
+            # Subtle dark border so the play-field edges are clear
+            pygame.draw.rect(surf, (30, 30, 30), (0, 0, SCREEN_W, SCREEN_H), 4)
+            return surf
+        except Exception as e:
+            print(f"[BG] Could not load map.png: {e}")
+
+    # Fallback: dark grid
     surf.fill((18, 18, 18))
     grid = 64
     for x in range(0, SCREEN_W, grid):
@@ -30,25 +56,31 @@ def _make_arena_bg():
     return surf
 
 
+# ── Main ───────────────────────────────────────────────────────────────
+
 async def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
     pygame.display.set_caption(TITLE)
     clock  = pygame.time.Clock()
 
-    all_sprites  = pygame.sprite.Group()
-    bullet_group = pygame.sprite.Group()
-    player_group = pygame.sprite.GroupSingle()
-    remote_group = pygame.sprite.Group()
+    all_sprites          = pygame.sprite.Group()
+    bullet_group         = pygame.sprite.Group()
+    remote_bullets_group = pygame.sprite.Group()
+    player_group         = pygame.sprite.GroupSingle()
+    remote_group         = pygame.sprite.Group()
 
     sound = SoundManager()
-    ui    = UI()
+    ui    = UI(sound)
     bg    = _make_arena_bg()
 
     player = Player(SCREEN_W // 2, SCREEN_H // 2, (all_sprites, player_group), slot=0)
     em     = EnemyManager(all_sprites)
 
-    remote_players: dict = {}   # slot -> RemotePlayer
+    remote_players: dict = {}     # slot -> RemotePlayer
+    remote_blt_sprites: dict = {} # (slot, bid) -> RemoteBullet
+
+    _next_bid = 0
 
     # ── State ──────────────────────────────────────────────────────────
     state   = STATE_MENU
@@ -60,10 +92,11 @@ async def main():
     pending_action = None
 
     is_host      = False
+    is_lan       = False
     lan_server   = None
     lan_client   = None
     local_slot   = 0
-    players_info = []
+    players_info = []   # list of {slot, username, kills, dead, respawn_timer}
     lobby_mode   = None
     join_ip      = ""
     join_cursor_visible = True
@@ -71,11 +104,16 @@ async def main():
     typing_join_ip = False
     net_tick_timer = 0.0
 
-    # Pause
     paused_game_snap  = None
     restart_countdown = -1
     restart_cd_timer  = 0.0
     pending_restart   = False
+
+    # Spectator / respawn (LAN)
+    # local player's respawn countdown (-1 = not dead in spectator mode)
+    local_respawn_timer = -1.0
+    # remote players' respawn timers: slot -> float seconds remaining
+    remote_respawn_timers: dict = {}
 
     _click_held = False
 
@@ -83,14 +121,21 @@ async def main():
 
     def _start_game():
         nonlocal state, elapsed, paused_game_snap, pending_restart
-        nonlocal restart_countdown, restart_cd_timer
+        nonlocal restart_countdown, restart_cd_timer, _next_bid
+        nonlocal local_respawn_timer, remote_respawn_timers
         all_sprites.empty()
         bullet_group.empty()
+        remote_bullets_group.empty()
         remote_group.empty()
         remote_players.clear()
+        remote_blt_sprites.clear()
+        _next_bid = 0
+        local_respawn_timer = -1.0
+        remote_respawn_timers = {}
         player.slot = local_slot
         player._load_sprites(local_slot)
         player.image = player.frames["idle"]
+        player.mask  = pygame.mask.from_surface(player.image)
         player.add(all_sprites, player_group)
         player.reset()
         em.reset()
@@ -101,6 +146,7 @@ async def main():
         restart_cd_timer  = 0.0
         state = STATE_PLAYING
         sound.stop_bgm()
+        sound.stop_menu_bgm()
         sound.play_bgm()
         sound.set_crosshair()
         sound.set_paused_filter(False)
@@ -111,40 +157,104 @@ async def main():
             remote_players[slot] = rp
         return remote_players[slot]
 
+    def _all_player_positions():
+        """(x,y) of all living players for enemy targeting."""
+        positions = []
+        if not player.is_dead:
+            positions.append((player.fx, player.fy))
+        for rp in remote_players.values():
+            if not rp.is_dead:
+                positions.append((rp.fx, rp.fy))
+        return positions if positions else [(SCREEN_W // 2, SCREEN_H // 2)]
+
+    def _all_players_list():
+        result = [player]
+        result.extend(remote_players.values())
+        return result
+
+    def _sync_remote_bullets(bullets_by_slot: dict):
+        live_keys = set()
+        for slot, blist in bullets_by_slot.items():
+            slot = int(slot)
+            if slot == local_slot:
+                continue
+            for bd in blist:
+                key = (slot, bd["bid"])
+                live_keys.add(key)
+                if key not in remote_blt_sprites:
+                    rb = RemoteBullet(bd["bid"], bd["x"], bd["y"],
+                                      bd["vx"], bd["vy"], (remote_bullets_group,))
+                    remote_blt_sprites[key] = rb
+                else:
+                    rb = remote_blt_sprites[key]
+                    rb.fx = bd["x"]; rb.fy = bd["y"]
+                    rb.rect.centerx = int(rb.fx)
+                    rb.rect.centery = int(rb.fy)
+
+        dead_keys = [k for k in remote_blt_sprites if k not in live_keys]
+        for k in dead_keys:
+            remote_blt_sprites[k].kill()
+            del remote_blt_sprites[k]
+
+    def _local_bullets_snapshot():
+        return [{"bid": getattr(s, "bid", 0),
+                 "x": s.fx, "y": s.fy, "vx": s.vx, "vy": s.vy}
+                for s in bullet_group.sprites()]
+
+    def _get_player_info(slot):
+        return next((p for p in players_info if p["slot"] == slot), None)
+
+    def _upsert_player_info(slot, **kwargs):
+        p = _get_player_info(slot)
+        if p is None:
+            p = {"slot": slot, "username": f"P{slot+1}", "kills": 0,
+                 "dead": False, "respawn_timer": -1.0}
+            players_info.append(p)
+        p.update(kwargs)
+
+    def _all_lan_players_dead():
+        """True only when every player in the session is dead (game over)."""
+        if not player.is_dead:
+            return False
+        for rp in remote_players.values():
+            if not rp.is_dead:
+                return False
+        return True
+
+    def _any_other_player_alive():
+        """True if at least one other (remote) player is still alive."""
+        for rp in remote_players.values():
+            if not rp.is_dead:
+                return True
+        return False
+
     def _draw_scene():
-        """Draw arena + sprites + HUD (shared between PLAYING and PAUSED)."""
         screen.blit(bg, (0, 0))
         all_sprites.draw(screen)
         bullet_group.draw(screen)
+        remote_bullets_group.draw(screen)
         for slot, rp in remote_players.items():
-            p_info = next((p for p in players_info if p["slot"] == slot), None)
+            p_info = _get_player_info(slot)
             name   = p_info["username"] if p_info else rp.username
             color  = PLAYER_COLORS[slot % len(PLAYER_COLORS)]
             _draw_name_tag(screen, name, rp.rect.centerx, rp.rect.top - 4, color)
-        ui.draw_hud(screen, elapsed, em.kill_counts, player.lives, players_info)
+        # Pass respawn timers so HUD can show countdown next to dead players
+        rtimers = dict(remote_respawn_timers)
+        if local_respawn_timer >= 0:
+            rtimers[local_slot] = local_respawn_timer
+        ui.draw_hud(screen, elapsed, em.kill_counts, player.lives,
+                    players_info, respawn_timers=rtimers)
         sound.draw_crosshair(screen)
 
+    # ── Network helpers ────────────────────────────────────────────────
+
     def _net_tick_host():
-        """Host networking: process client events, broadcast state."""
         for ev in lan_server.get_events():
             if ev["type"] == "hit":
                 em.apply_hit_from_client(ev["eid"], ev["slot"], sound)
 
         client_positions = lan_server.get_client_positions()
-
-        state_snapshot = {
-            "type":           "game",
-            "kill_counts":    em.kill_counts,
-            "elapsed":        elapsed,
-            "enemies":        em.serialise_enemies(),
-            "host_pos":       player.get_net_state(),
-            "remote_players": client_positions,
-        }
-        lan_server.push_state(state_snapshot)
-
-        for p in players_info:
-            s = p["slot"]
-            p["kills"] = em.kill_counts[s] if s < len(em.kill_counts) else 0
+        client_bullets   = lan_server.get_client_bullets()
 
         for slot_int, pos_data in client_positions.items():
             slot = int(slot_int)
@@ -152,43 +262,92 @@ async def main():
             rp.username = pos_data.get("username", rp.username)
             rp.apply_state(pos_data, dt)
 
+        host_bullets = _local_bullets_snapshot()
+        all_bullets  = {str(local_slot): host_bullets}
+        for slot_int, blist in client_bullets.items():
+            all_bullets[str(slot_int)] = blist
+
+        # Sync kill counts into players_info for all players
+        for p in players_info:
+            s = p["slot"]
+            p["kills"] = em.kill_counts[s] if s < len(em.kill_counts) else 0
+            p["dead"]  = (s == local_slot and player.is_dead) or \
+                         (s != local_slot and remote_players.get(s, None) is not None
+                          and remote_players[s].is_dead)
+
+        # Broadcast respawn timers for all clients
+        rt_export = {}
+        if local_respawn_timer >= 0:
+            rt_export[str(local_slot)] = local_respawn_timer
+        for s, t in remote_respawn_timers.items():
+            rt_export[str(s)] = t
+
+        state_snapshot = {
+            "type":            "game",
+            "kill_counts":     em.kill_counts,
+            "elapsed":         elapsed,
+            "enemies":         em.serialise_enemies(),
+            "host_pos":        player.get_net_state(),
+            "remote_players":  client_positions,
+            "bullets":         all_bullets,
+            "respawn_timers":  rt_export,
+        }
+        lan_server.push_state(state_snapshot)
+
     def _net_tick_client():
-        """Client networking: send position, apply host state."""
         lan_client.send_pos(player.get_net_state())
+        lan_client.send_bullets(_local_bullets_snapshot())
 
         sv = lan_client.get_state()
         if not sv:
             return sv
 
         if sv.get("type") == "game":
-            # Sync enemies from host
-            enemy_states = sv.get("enemies", [])
-            em.apply_remote_enemies(enemy_states, dt)
-            em.apply_remote_kill_counts(sv.get("kill_counts", []))
+            em.apply_remote_enemies(sv.get("enemies", []), dt)
 
-            # Sync host's sprite
+            # Sync kill counts from host — this fixes clients not seeing others' scores
+            kc = sv.get("kill_counts", [])
+            em.apply_remote_kill_counts(kc)
+
+            # Update players_info kills from authoritative host kill_counts
+            for p in players_info:
+                s = p["slot"]
+                if s < len(kc):
+                    p["kills"] = kc[s]
+
             host_pos = sv.get("host_pos")
             if host_pos:
                 hp = _ensure_remote(0)
                 hp.apply_state(host_pos, dt)
 
-            # Sync other clients' sprites
             for slot_str, pos_data in sv.get("remote_players", {}).items():
                 slot = int(slot_str)
                 if slot != local_slot:
                     rp = _ensure_remote(slot)
                     rp.apply_state(pos_data, dt)
 
-            # Update local players_info kills
-            for p in players_info:
-                if p["slot"] == local_slot:
-                    p["kills"] = em.kill_counts[local_slot]
+            _sync_remote_bullets(sv.get("bullets", {}))
+
+            # Sync respawn timers from host
+            rt = sv.get("respawn_timers", {})
+            nonlocal local_respawn_timer
+            for slot_str, t in rt.items():
+                slot = int(slot_str)
+                if slot == local_slot:
+                    local_respawn_timer = float(t)
+                else:
+                    remote_respawn_timers[slot] = float(t)
+            # Clear timers for slots not in host broadcast
+            for slot in list(remote_respawn_timers.keys()):
+                if str(slot) not in rt and slot != local_slot:
+                    del remote_respawn_timers[slot]
 
         return sv
 
     # ── Main loop ──────────────────────────────────────────────────────
     while True:
         dt = min(clock.tick(FPS) / 1000.0, 0.05)
+        nonlocal_next_bid = [_next_bid]
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -200,14 +359,14 @@ async def main():
                 _click_held = False
 
             if event.type == pygame.MOUSEBUTTONDOWN:
+                # Allow shooting even in spectator (so respawning player is ready)
                 if state == STATE_PLAYING and event.button == 1:
-                    if player.try_shoot(pygame.mouse.get_pos(), bullet_group, all_sprites):
-                        sound.play("shoot")
-                        # Clients report hits by eid so host can attribute kills
-                        if lan_client and lan_client.connected:
-                            hits = pygame.sprite.spritecollide(
-                                player, em.enemies, False)  # not used; hits come from bullet
-                            # Actual hit reporting happens during bullet-enemy collision below
+                    if not player.is_dead:
+                        bid = nonlocal_next_bid[0]
+                        nonlocal_next_bid[0] += 1
+                        if player.try_shoot(pygame.mouse.get_pos(), bullet_group,
+                                            all_sprites, bid=bid):
+                            sound.play("shoot")
 
             if event.type == pygame.KEYDOWN:
                 if state == STATE_USERNAME:
@@ -215,7 +374,9 @@ async def main():
                         if username.strip():
                             if pending_action == "solo":
                                 local_slot   = 0
-                                players_info = [{"slot": 0, "username": username, "kills": 0}]
+                                players_info = [{"slot": 0, "username": username,
+                                                 "kills": 0, "dead": False,
+                                                 "respawn_timer": -1.0}]
                                 _start_game()
                             elif pending_action == "lan":
                                 state = STATE_LOBBY
@@ -234,21 +395,20 @@ async def main():
 
                 elif event.key == pygame.K_ESCAPE:
                     if state == STATE_PLAYING:
-                        is_lan = (lan_server is not None or lan_client is not None)
-                        paused_game_snap = None   # will be captured first frame of PAUSED
+                        paused_game_snap = None
                         state = STATE_PAUSED
                         sound.set_paused_filter(True)
-                        # Solo only: freeze bgm/steps
                         if not is_lan:
                             sound.stop_bgm()
                             sound.stop_steps()
                     elif state == STATE_PAUSED:
                         state = STATE_PLAYING
                         sound.set_paused_filter(False)
-                        is_lan = (lan_server is not None or lan_client is not None)
                         if not is_lan:
                             sound.play_bgm()
                         paused_game_snap = None
+
+        _next_bid = nonlocal_next_bid[0]
 
         keys      = pygame.key.get_pressed()
         mouse_pos = pygame.mouse.get_pos()
@@ -257,22 +417,28 @@ async def main():
         # ── MENU ───────────────────────────────────────────────────────
         if state == STATE_MENU:
             sound.restore_cursor()
+            sound.play_menu_bgm()
             screen.blit(bg, (0, 0))
             action = ui.draw_menu(screen)
             if clicked:
                 _click_held = True
                 if action == "play_solo":
+                    sound.play_btn()
                     pending_action = "solo"; state = STATE_USERNAME
                 elif action == "play_lan":
+                    sound.play_btn()
                     pending_action = "lan";  state = STATE_USERNAME
                 elif action == "quit":
+                    sound.play_btn()
                     pygame.quit(); sys.exit()
                 elif action == "lang":
+                    sound.play_btn()
                     ui.toggle_lang()
 
         # ── USERNAME ───────────────────────────────────────────────────
         elif state == STATE_USERNAME:
             sound.restore_cursor()
+            sound.play_menu_bgm()
             cursor_timer += dt
             if cursor_timer >= 0.5:
                 cursor_timer = 0.0; cursor_visible = not cursor_visible
@@ -281,18 +447,22 @@ async def main():
             if clicked:
                 _click_held = True
                 if action == "confirm" and username.strip():
+                    sound.play_btn()
                     if pending_action == "solo":
                         local_slot   = 0
-                        players_info = [{"slot": 0, "username": username, "kills": 0}]
+                        players_info = [{"slot": 0, "username": username,
+                                         "kills": 0, "dead": False, "respawn_timer": -1.0}]
                         _start_game()
                     elif pending_action == "lan":
                         state = STATE_LOBBY
                 elif action == "lang":
+                    sound.play_btn()
                     ui.toggle_lang()
 
         # ── LOBBY ──────────────────────────────────────────────────────
         elif state == STATE_LOBBY:
             sound.restore_cursor()
+            sound.play_menu_bgm()
             join_cursor_timer += dt
             if join_cursor_timer >= 0.5:
                 join_cursor_timer = 0.0; join_cursor_visible = not join_cursor_visible
@@ -302,31 +472,46 @@ async def main():
                 action = _host_join_action(screen, ui, clicked)
                 _draw_host_join_choice(screen, ui, clicked)
                 if action == "host":
-                    lobby_mode   = "host"; is_host = True; local_slot = 0
-                    lan_server   = LANServer(host_username=username)
-                    players_info = [{"slot": 0, "username": username, "kills": 0}]
+                    sound.play_btn()
+                    lobby_mode = "host"; is_host = True; is_lan = True; local_slot = 0
+                    lan_server = LANServer(host_username=username)
+                    players_info = [{"slot": 0, "username": username, "kills": 0,
+                                     "dead": False, "respawn_timer": -1.0}]
                 elif action == "join":
-                    lobby_mode = "join"; is_host = False
+                    sound.play_btn()
+                    lobby_mode = "join"; is_host = False; is_lan = True
                 elif action == "back":
+                    sound.play_btn()
                     state = STATE_MENU; lobby_mode = None
                 elif action == "lang":
+                    sound.play_btn()
                     ui.toggle_lang()
             else:
                 if is_host and lan_server:
                     remote = lan_server.connected_players()
-                    host_entry = next((p for p in players_info if p["slot"] == 0), None)
-                    players_info = ([host_entry] if host_entry else []) + remote
+                    host_entry = _get_player_info(0)
+                    players_info = ([host_entry] if host_entry else []) + [
+                        {"slot": r["slot"], "username": r["username"],
+                         "kills": 0, "dead": False, "respawn_timer": -1.0}
+                        for r in remote
+                    ]
 
                 if lan_client and lan_client.connected:
                     lp = lan_client.lobby_players
                     if lp:
-                        mine   = next((p for p in players_info if p["slot"] == local_slot), None)
+                        mine = _get_player_info(local_slot)
                         merged = [mine] if mine else []
                         for rp in lp:
                             if rp["slot"] != local_slot:
-                                ex = next((p for p in merged if p["slot"] == rp["slot"]), None)
-                                if ex: ex["username"] = rp["username"]
-                                else:  merged.append({"slot": rp["slot"], "username": rp["username"], "kills": 0})
+                                ex = next((p for p in merged
+                                           if p["slot"] == rp["slot"]), None)
+                                if ex:
+                                    ex["username"] = rp["username"]
+                                else:
+                                    merged.append({"slot": rp["slot"],
+                                                   "username": rp["username"],
+                                                   "kills": 0, "dead": False,
+                                                   "respawn_timer": -1.0})
                         players_info = sorted(merged, key=lambda p: p["slot"])
 
                 screen.blit(bg, (0, 0))
@@ -335,23 +520,29 @@ async def main():
                 if clicked:
                     _click_held = True
                     if action == "start" and is_host:
+                        sound.play_btn()
                         if lan_server: lan_server.push_state({"type": "start"})
                         local_slot = 0; _start_game()
                     elif action == "join":
+                        sound.play_btn()
                         host_ip    = join_ip.strip() or "127.0.0.1"
                         lan_client = LANClient(host_ip, username)
                         if lan_client.connected:
                             local_slot   = lan_client.slot
-                            players_info = [{"slot": local_slot, "username": username, "kills": 0}]
+                            players_info = [{"slot": local_slot, "username": username,
+                                             "kills": 0, "dead": False,
+                                             "respawn_timer": -1.0}]
                         else:
                             lan_client = None
                     elif action == "typing":
                         typing_join_ip = True
                     elif action == "back":
+                        sound.play_btn()
                         if lan_server: lan_server.stop(); lan_server = None
                         if lan_client: lan_client.stop(); lan_client = None
-                        lobby_mode = None; state = STATE_MENU
+                        is_lan = False; lobby_mode = None; state = STATE_MENU
                     elif action == "lang":
+                        sound.play_btn()
                         ui.toggle_lang()
 
                 if lan_client and lan_client.connected:
@@ -362,117 +553,102 @@ async def main():
         # ── PLAYING ────────────────────────────────────────────────────
         elif state == STATE_PLAYING:
             elapsed += dt
-            player.update(dt, keys, mouse_pos)
 
-            moving = any([keys[pygame.K_LEFT], keys[pygame.K_a], keys[pygame.K_q],
-                          keys[pygame.K_RIGHT], keys[pygame.K_d],
-                          keys[pygame.K_UP], keys[pygame.K_w], keys[pygame.K_z],
-                          keys[pygame.K_DOWN], keys[pygame.K_s]])
-            if moving: sound.play("player_steps")
-            else:      sound.stop_steps()
-
-            bullet_group.update(dt)
-
-            is_lan = (lan_server is not None or lan_client is not None)
-
-            if lan_server:
-                # HOST: full simulation
-                em.update(dt, player.rect.center, bullet_group, player, sound, local_slot)
-            elif lan_client and lan_client.connected:
-                # CLIENT: detect bullet hits and report to host by eid
-                for enemy in list(em.enemies):
-                    hits = pygame.sprite.spritecollide(enemy, bullet_group, True)
-                    if hits:
-                        lan_client.send_hit(enemy.eid)
-                        sound.play("monster_hurt")
-                # Contact damage on client (local feel, host is authoritative for lives)
-                for enemy in list(em.enemies):
-                    if (not enemy._dying
-                            and enemy.rect.colliderect(player.rect)
-                            and enemy.can_damage_player()):
-                        enemy.mark_contact()
-                        player.take_damage()
-                        sound.play("player_hurt")
-            else:
-                # SOLO: full simulation
-                em.update(dt, player.rect.center, bullet_group, player, sound, local_slot)
-
-            # Network tick
-            net_tick_timer += dt
-            if net_tick_timer >= 1.0 / LAN_TICK_RATE:
-                net_tick_timer = 0.0
-                if lan_server:
-                    _net_tick_host()
-                elif lan_client and lan_client.connected:
-                    sv = _net_tick_client()
-                    if sv:
-                        if sv.get("type") == "restart_countdown":
-                            restart_countdown = sv.get("secs", 5)
-                        elif sv.get("type") == "restart":
-                            _start_game()
-
-            for p in players_info:
-                if p["slot"] == local_slot:
-                    p["kills"] = em.kill_counts[local_slot]
-
-            if player.is_dead:
-                state = STATE_DEAD
-                sound.stop_bgm(); sound.restore_cursor(); sound.stop_steps()
-                sound.play("player_death")
-
-            _draw_scene()
-
-        # ── PAUSED ─────────────────────────────────────────────────────
-        elif state == STATE_PAUSED:
-            is_lan = (lan_server is not None or lan_client is not None)
-
-            # Always advance local player input and bullets (LAN) or freeze (solo)
-            if is_lan:
-                elapsed += dt
+            # Only update local player if they're alive (or still in dying anim)
+            if not player.is_dead:
                 player.update(dt, keys, mouse_pos)
-
                 moving = any([keys[pygame.K_LEFT], keys[pygame.K_a], keys[pygame.K_q],
                               keys[pygame.K_RIGHT], keys[pygame.K_d],
                               keys[pygame.K_UP], keys[pygame.K_w], keys[pygame.K_z],
                               keys[pygame.K_DOWN], keys[pygame.K_s]])
                 if moving: sound.play("player_steps")
                 else:      sound.stop_steps()
+            else:
+                sound.stop_steps()
 
-                bullet_group.update(dt)
+            bullet_group.update(dt)
+            remote_bullets_group.update(dt)
 
-                if lan_server:
-                    em.update(dt, player.rect.center, bullet_group, player, sound, local_slot)
-                elif lan_client and lan_client.connected:
+            all_pos = _all_player_positions()
+            all_pls = _all_players_list()
+
+            if lan_server:
+                em.update(dt, all_pos, bullet_group, all_pls, sound, local_slot)
+            elif lan_client and lan_client.connected:
+                for enemy in list(em.enemies):
+                    hits = pygame.sprite.spritecollide(
+                        enemy, bullet_group, True, pygame.sprite.collide_mask)
+                    if hits:
+                        lan_client.send_hit(enemy.eid)
+                        sound.play("monster_hurt")
+                if not player.is_dead:
                     for enemy in list(em.enemies):
-                        hits = pygame.sprite.spritecollide(enemy, bullet_group, True)
-                        if hits:
-                            lan_client.send_hit(enemy.eid)
-                    for enemy in list(em.enemies):
-                        if (not enemy._dying
-                                and enemy.rect.colliderect(player.rect)
-                                and enemy.can_damage_player()):
-                            enemy.mark_contact()
-                            player.take_damage()
+                        if not enemy._dying and enemy.can_damage_player():
+                            if (enemy.rect.colliderect(player.rect) and
+                                    _mask_overlap(enemy, player)):
+                                enemy.mark_contact()
+                                player.take_damage()
+                                sound.play("player_hurt")
+            else:
+                em.update(dt, all_pos, bullet_group, all_pls, sound, local_slot)
 
-                net_tick_timer += dt
-                if net_tick_timer >= 1.0 / LAN_TICK_RATE:
-                    net_tick_timer = 0.0
-                    if lan_server:
-                        _net_tick_host()
-                    elif lan_client and lan_client.connected:
-                        sv = _net_tick_client()
-                        if sv:
-                            if sv.get("type") == "restart_countdown":
-                                restart_countdown = sv.get("secs", 5)
-                            elif sv.get("type") == "restart":
-                                _start_game()
+            # ── Respawn / spectator logic (LAN only) ───────────────────
+            if is_lan:
+                # Tick local respawn timer
+                if player.is_dead:
+                    if local_respawn_timer < 0:
+                        # Just died — start countdown
+                        local_respawn_timer = RESPAWN_DELAY
+                        sound.stop_bgm()
+                        sound.restore_cursor()
+                        sound.stop_steps()
+                        sound.play("player_death")
+                    else:
+                        local_respawn_timer = max(0.0, local_respawn_timer - dt)
+                        if local_respawn_timer <= 0 and _any_other_player_alive():
+                            # RESPAWN
+                            player.respawn(SCREEN_W // 2, SCREEN_H // 2,
+                                           RESPAWN_LIVES, RESPAWN_IFRAMES)
+                            local_respawn_timer = -1.0
+                            sound.play_bgm()
+                            sound.set_crosshair()
+                        elif local_respawn_timer <= 0 and not _any_other_player_alive():
+                            # Everyone dead — real game over
+                            local_respawn_timer = -1.0
+                            state = STATE_DEAD
 
+                # Tick remote respawn timers (host only — authoritative)
+                if is_host:
+                    for slot, rp in list(remote_players.items()):
+                        if rp.is_dead:
+                            if slot not in remote_respawn_timers:
+                                remote_respawn_timers[slot] = RESPAWN_DELAY
+                            else:
+                                remote_respawn_timers[slot] = max(
+                                    0.0, remote_respawn_timers[slot] - dt)
+                        else:
+                            remote_respawn_timers.pop(slot, None)
+
+                    # Send respawn command to clients whose timer hit 0
+                    for slot in list(remote_respawn_timers.keys()):
+                        if remote_respawn_timers[slot] <= 0:
+                            # Host will send a state packet with respawn_slot
+                            lan_server.send_respawn(slot)
+                            del remote_respawn_timers[slot]
+
+                # Check all-dead (LAN game over)
+                if _all_lan_players_dead() and local_respawn_timer < 0:
+                    state = STATE_DEAD
+                    sound.stop_bgm(); sound.restore_cursor(); sound.stop_steps()
+
+            else:
+                # Solo: standard death
                 if player.is_dead:
                     state = STATE_DEAD
                     sound.stop_bgm(); sound.restore_cursor(); sound.stop_steps()
                     sound.play("player_death")
 
-            # Countdown tick (host restart)
+            # Countdown for host-triggered restart
             if pending_restart:
                 restart_cd_timer -= dt
                 remaining = max(0, int(restart_cd_timer))
@@ -484,12 +660,114 @@ async def main():
                     if lan_server:
                         lan_server.broadcast_restart()
                     _start_game()
-                    continue  # skip rest of frame — state changed
+                    continue
 
-            # Draw live game scene first, then pause overlay on top
+            # Network tick
+            net_tick_timer += dt
+            if net_tick_timer >= 1.0 / LAN_TICK_RATE:
+                net_tick_timer = 0.0
+                if lan_server:
+                    _net_tick_host()
+                elif lan_client and lan_client.connected:
+                    sv = _net_tick_client()
+                    if sv:
+                        t = sv.get("type")
+                        if t == "restart_countdown":
+                            restart_countdown = sv.get("secs", 5)
+                        elif t == "restart":
+                            _start_game()
+                        elif t == "respawn":
+                            # Host told us (a client) to respawn
+                            if sv.get("slot") == local_slot:
+                                player.respawn(SCREEN_W // 2, SCREEN_H // 2,
+                                               RESPAWN_LIVES, RESPAWN_IFRAMES)
+                                local_respawn_timer = -1.0
+                                sound.play_bgm()
+                                sound.set_crosshair()
+
+            # Sync players_info kills for local slot
+            p_local = _get_player_info(local_slot)
+            if p_local:
+                p_local["kills"] = em.kill_counts[local_slot]
+                p_local["dead"]  = player.is_dead
+                p_local["respawn_timer"] = local_respawn_timer
+
             _draw_scene()
 
-            # Capture snapshot for blur only once (first frame entering pause)
+        # ── PAUSED ─────────────────────────────────────────────────────
+        elif state == STATE_PAUSED:
+            if is_lan:
+                elapsed += dt
+                if not player.is_dead:
+                    player.update(dt, keys, mouse_pos)
+                    moving = any([keys[pygame.K_LEFT], keys[pygame.K_a], keys[pygame.K_q],
+                                  keys[pygame.K_RIGHT], keys[pygame.K_d],
+                                  keys[pygame.K_UP], keys[pygame.K_w], keys[pygame.K_z],
+                                  keys[pygame.K_DOWN], keys[pygame.K_s]])
+                    if moving: sound.play("player_steps")
+                    else:      sound.stop_steps()
+
+                bullet_group.update(dt)
+                remote_bullets_group.update(dt)
+
+                all_pos = _all_player_positions()
+                all_pls = _all_players_list()
+
+                if lan_server:
+                    em.update(dt, all_pos, bullet_group, all_pls, sound, local_slot)
+                elif lan_client and lan_client.connected:
+                    for enemy in list(em.enemies):
+                        hits = pygame.sprite.spritecollide(
+                            enemy, bullet_group, True, pygame.sprite.collide_mask)
+                        if hits:
+                            lan_client.send_hit(enemy.eid)
+                    if not player.is_dead:
+                        for enemy in list(em.enemies):
+                            if not enemy._dying and enemy.can_damage_player():
+                                if (enemy.rect.colliderect(player.rect) and
+                                        _mask_overlap(enemy, player)):
+                                    enemy.mark_contact()
+                                    player.take_damage()
+
+                net_tick_timer += dt
+                if net_tick_timer >= 1.0 / LAN_TICK_RATE:
+                    net_tick_timer = 0.0
+                    if lan_server:
+                        _net_tick_host()
+                    elif lan_client and lan_client.connected:
+                        sv = _net_tick_client()
+                        if sv:
+                            t = sv.get("type")
+                            if t == "restart_countdown":
+                                restart_countdown = sv.get("secs", 5)
+                            elif t == "restart":
+                                _start_game()
+                            elif t == "respawn" and sv.get("slot") == local_slot:
+                                player.respawn(SCREEN_W // 2, SCREEN_H // 2,
+                                               RESPAWN_LIVES, RESPAWN_IFRAMES)
+                                local_respawn_timer = -1.0
+                                sound.play_bgm()
+                                sound.set_crosshair()
+
+                if is_lan and _all_lan_players_dead() and local_respawn_timer < 0:
+                    state = STATE_DEAD
+                    sound.stop_bgm(); sound.restore_cursor()
+
+            if pending_restart:
+                restart_cd_timer -= dt
+                remaining = max(0, int(restart_cd_timer))
+                if restart_countdown != remaining:
+                    restart_countdown = remaining
+                    if lan_server:
+                        lan_server.broadcast_restart_countdown(remaining)
+                if restart_cd_timer <= 0:
+                    if lan_server:
+                        lan_server.broadcast_restart()
+                    _start_game()
+                    continue
+
+            _draw_scene()
+
             if paused_game_snap is None:
                 paused_game_snap = screen.copy()
 
@@ -500,34 +778,33 @@ async def main():
             if clicked:
                 _click_held = True
                 if action == "resume":
+                    sound.play_btn()
                     state = STATE_PLAYING
                     sound.set_paused_filter(False)
                     if not is_lan: sound.play_bgm()
                     paused_game_snap = None
-
                 elif action == "restart":
+                    sound.play_btn()
                     if is_lan and is_host:
-                        # Close pause menu immediately, host keeps playing,
-                        # countdown runs in background
-                        pending_restart   = True
-                        restart_cd_timer  = 5.0
+                        pending_restart  = True
+                        restart_cd_timer = 5.0
                         restart_countdown = 5
-                        state = STATE_PLAYING          # <-- unpause right away
+                        state = STATE_PLAYING
                         sound.set_paused_filter(False)
                         paused_game_snap = None
                         if lan_server:
                             lan_server.broadcast_restart_countdown(5)
                     else:
-                        # Solo restart
                         sound.set_paused_filter(False)
                         _start_game()
-
                 elif action == "lang":
+                    sound.play_btn()
                     ui.toggle_lang()
-
                 elif action == "quit":
+                    sound.play_btn()
                     if lan_server: lan_server.stop(); lan_server = None
                     if lan_client: lan_client.stop(); lan_client = None
+                    is_lan = False
                     sound.set_paused_filter(False)
                     sound.stop_bgm(); sound.restore_cursor()
                     state = STATE_MENU; lobby_mode = None
@@ -535,18 +812,24 @@ async def main():
 
         # ── DEAD ───────────────────────────────────────────────────────
         elif state == STATE_DEAD:
+            # Draw the live game scene behind the death overlay
             screen.blit(bg, (0, 0))
             all_sprites.draw(screen)
             action = ui.draw_death(screen, elapsed, em.kill_counts, players_info)
             if clicked:
                 _click_held = True
                 if action == "retry":
+                    sound.play_btn()
                     _start_game()
                 elif action == "quit":
+                    sound.play_btn()
                     if lan_server: lan_server.stop(); lan_server = None
                     if lan_client: lan_client.stop(); lan_client = None
+                    is_lan = False
                     state = STATE_MENU; lobby_mode = None
+                    sound.play_menu_bgm()
                 elif action == "lang":
+                    sound.play_btn()
                     ui.toggle_lang()
 
         pygame.display.flip()
@@ -555,20 +838,28 @@ async def main():
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
+def _mask_overlap(sprite_a, sprite_b) -> bool:
+    mask_a = getattr(sprite_a, 'mask', None) or pygame.mask.from_surface(sprite_a.image)
+    mask_b = getattr(sprite_b, 'mask', None) or pygame.mask.from_surface(sprite_b.image)
+    offset = (sprite_a.rect.x - sprite_b.rect.x, sprite_a.rect.y - sprite_b.rect.y)
+    return bool(mask_b.overlap(mask_a, offset))
+
+
 def _draw_name_tag(surface, name, cx, top_y, color):
     font = pygame.font.SysFont("monospace", 14, bold=True)
     surf = font.render(name, True, color)
     x = cx - surf.get_width() // 2
     y = top_y - surf.get_height() - 2
-    bg = pygame.Surface((surf.get_width() + 6, surf.get_height() + 2), pygame.SRCALPHA)
-    bg.fill((0, 0, 0, 120))
-    surface.blit(bg,   (x - 3, y - 1))
+    bg_s = pygame.Surface((surf.get_width() + 6, surf.get_height() + 2), pygame.SRCALPHA)
+    bg_s.fill((0, 0, 0, 120))
+    surface.blit(bg_s, (x - 3, y - 1))
     surface.blit(surf, (x, y))
 
 
 _hj_host_rect = None
 _hj_join_rect = None
 _hj_back_rect = None
+
 
 def _draw_host_join_choice(surface, ui, clicked):
     global _hj_host_rect, _hj_join_rect, _hj_back_rect
@@ -591,8 +882,8 @@ def _draw_host_join_choice(surface, ui, clicked):
     def btn(text, rect, bg_col):
         hover = rect.collidepoint(pygame.mouse.get_pos())
         col   = tuple(min(255, c + 30) for c in bg_col) if hover else bg_col
-        pygame.draw.rect(surface, col,       rect, border_radius=6)
-        pygame.draw.rect(surface, (80,80,80),rect, width=2, border_radius=6)
+        pygame.draw.rect(surface, col,         rect, border_radius=6)
+        pygame.draw.rect(surface, (80, 80, 80), rect, width=2, border_radius=6)
         lbl = font_m.render(text, True, WHITE)
         surface.blit(lbl, lbl.get_rect(center=rect.center))
 
