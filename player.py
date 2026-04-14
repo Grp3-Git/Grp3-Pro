@@ -1,6 +1,7 @@
 # player.py — Player module (M2)
 # Multi-player aware: each player slot loads its own sprites (_2, _3, _4 suffix)
 # Handles: movement (WASD + ZQSD), rotation toward cursor, shooting, lives, iframes
+# NEW: respawn(x, y, lives, iframes) for LAN spectator-respawn system
 
 import pygame
 import math
@@ -16,11 +17,13 @@ class Bullet(pygame.sprite.Sprite):
         pygame.draw.circle(self.image, (255, 210, 40), (size // 2, size // 2), size // 2)
         pygame.draw.circle(self.image, (255, 245, 180), (size // 2, size // 2), size // 4)
         self.rect   = self.image.get_rect(center=(x, y))
+        self.mask   = pygame.mask.from_surface(self.image)
         self.vx     = dx * BULLET_SPEED
         self.vy     = dy * BULLET_SPEED
         self.damage = BULLET_DAMAGE
         self.fx     = float(x)
         self.fy     = float(y)
+        self.bid    = 0   # filled in by caller
 
     def update(self, dt, *args, **kwargs):
         self.fx += self.vx * dt
@@ -45,6 +48,7 @@ class RemotePlayer(pygame.sprite.Sprite):
         self.fx = float(SCREEN_W // 2)
         self.fy = float(SCREEN_H // 2)
         self.rect = self.image.get_rect(center=(int(self.fx), int(self.fy)))
+        self.mask = pygame.mask.from_surface(self.image)
         self._angle = 0.0
         self._anim_frame = 0
         self._anim_timer = 0.0
@@ -95,6 +99,36 @@ class RemotePlayer(pygame.sprite.Sprite):
         rotated = pygame.transform.rotate(base, self._angle)
         self.rect = rotated.get_rect(center=(int(self.fx), int(self.fy)))
         self.image = rotated
+        self.mask  = pygame.mask.from_surface(self.image)
+
+
+class RemoteBullet(pygame.sprite.Sprite):
+    """
+    Bullet fired by a remote player — received via LAN state broadcast.
+    Host spawns these; clients render them by syncing from host state.
+    """
+    def __init__(self, bid: int, x, y, vx, vy, groups):
+        super().__init__(groups)
+        self.bid = bid
+        size = 8
+        self.image = pygame.Surface((size, size), pygame.SRCALPHA)
+        pygame.draw.circle(self.image, (255, 210, 40), (size // 2, size // 2), size // 2)
+        pygame.draw.circle(self.image, (255, 245, 180), (size // 2, size // 2), size // 4)
+        self.rect  = self.image.get_rect(center=(int(x), int(y)))
+        self.mask  = pygame.mask.from_surface(self.image)
+        self.fx    = float(x)
+        self.fy    = float(y)
+        self.vx    = vx
+        self.vy    = vy
+
+    def update(self, dt, *args, **kwargs):
+        self.fx += self.vx * dt
+        self.fy += self.vy * dt
+        self.rect.centerx = int(self.fx)
+        self.rect.centery  = int(self.fy)
+        if (self.rect.right < 0 or self.rect.left > SCREEN_W or
+                self.rect.bottom < 0 or self.rect.top > SCREEN_H):
+            self.kill()
 
 
 class Player(pygame.sprite.Sprite):
@@ -103,10 +137,11 @@ class Player(pygame.sprite.Sprite):
 
     Public interface:
         player.update(dt, keys, mouse_pos)
-        player.try_shoot(mouse_pos, bullet_group, all_group) -> bool
+        player.try_shoot(mouse_pos, bullet_group, all_group, bid) -> bool
         player.take_damage(amount)
         player.reset(x, y)
-        player.get_net_state() -> dict   (for broadcasting over LAN)
+        player.respawn(x, y, lives, iframes)   ← NEW for LAN respawn
+        player.get_net_state() -> dict
         player.lives    (int)
         player.is_dead  (bool)
         player.rect     (pygame.Rect)
@@ -118,6 +153,7 @@ class Player(pygame.sprite.Sprite):
         self._load_sprites(slot)
         self.image = self.frames["idle"]
         self.rect  = self.image.get_rect(center=(x, y))
+        self.mask  = pygame.mask.from_surface(self.image)
 
         self.fx = float(x)
         self.fy = float(y)
@@ -216,8 +252,9 @@ class Player(pygame.sprite.Sprite):
             self.image = pygame.Surface(rotated.get_size(), pygame.SRCALPHA)
         else:
             self.image = rotated
+        self.mask = pygame.mask.from_surface(self.image)
 
-    def try_shoot(self, mouse_pos, bullet_group, all_group):
+    def try_shoot(self, mouse_pos, bullet_group, all_group, bid=0):
         if self._shoot_cd > 0 or self._dying:
             return False
         self._shoot_cd = PLAYER_SHOOT_CD
@@ -228,7 +265,8 @@ class Player(pygame.sprite.Sprite):
         dist = math.hypot(dx, dy)
         if dist == 0:
             return False
-        Bullet(cx, cy, dx / dist, dy / dist, (bullet_group, all_group))
+        b = Bullet(cx, cy, dx / dist, dy / dist, (bullet_group, all_group))
+        b.bid = bid
         return True
 
     def take_damage(self, amount=1):
@@ -242,6 +280,7 @@ class Player(pygame.sprite.Sprite):
             self._dead_timer = DEATH_DURATION
 
     def reset(self, x=None, y=None):
+        """Full reset for new game."""
         self.lives     = PLAYER_LIVES
         self.is_dead   = False
         self._dying    = False
@@ -255,6 +294,22 @@ class Player(pygame.sprite.Sprite):
         self.fy = float(cy)
         self.image = self.frames["idle"]
         self.rect  = self.image.get_rect(center=(cx, cy))
+        self.mask  = pygame.mask.from_surface(self.image)
+
+    def respawn(self, x, y, lives=1, iframes=3.0):
+        """LAN respawn — keeps kill count, restores control with invulnerability."""
+        self.lives     = lives
+        self.is_dead   = False
+        self._dying    = False
+        self._iframe   = iframes
+        self._shoot_cd = 0.0
+        self._angle    = 0.0
+        self._moving   = False
+        self.fx = float(x)
+        self.fy = float(y)
+        self.image = self.frames["idle"]
+        self.rect  = self.image.get_rect(center=(x, y))
+        self.mask  = pygame.mask.from_surface(self.image)
 
     def get_net_state(self) -> dict:
         """Snapshot for broadcasting to other LAN clients."""
