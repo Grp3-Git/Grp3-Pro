@@ -2,12 +2,15 @@
 # Run locally:  python src/main.py
 # Web build:    pygbag src/main.py
 #
-# Fully corrected version (April 2026)
-# • All previous LAN fixes included
-# • FIXED: player_death.ogg now plays correctly in LAN Game Over (same as solo)
-# • LAN Game Over appears on every client
-# • Ready-to-restart table + 5-second countdown when host presses Play Again
-# • Pause → Restart now auto-closes pause menu and shows countdown for everyone
+# Changes in this version:
+#   - map.png in assets/ used as ground texture (auto-scaled, fallback grid)
+#   - LAN: client players see correct live kill scores from host broadcast
+#   - LAN: Game Over screen only appears when ALL players are dead
+#   - LAN: dead players enter spectator mode, watch the others
+#   - LAN: 30-second respawn timer shown next to dead player name in HUD
+#   - LAN: After 30s (if any player alive), dead player respawns at center with
+#           RESPAWN_LIVES HP and RESPAWN_IFRAMES seconds of invulnerability
+#   - Individual player scores always visible ingame + total in bold red
 
 import asyncio
 import pygame
@@ -36,11 +39,13 @@ def _make_arena_bg():
             img = pygame.image.load(MAP_IMG_PATH).convert()
             img = pygame.transform.scale(img, (SCREEN_W, SCREEN_H))
             surf.blit(img, (0, 0))
+            # Subtle dark border so the play-field edges are clear
             pygame.draw.rect(surf, (30, 30, 30), (0, 0, SCREEN_W, SCREEN_H), 4)
             return surf
         except Exception as e:
             print(f"[BG] Could not load map.png: {e}")
 
+    # Fallback: dark grid
     surf.fill((18, 18, 18))
     grid = 64
     for x in range(0, SCREEN_W, grid):
@@ -72,8 +77,8 @@ async def main():
     player = Player(SCREEN_W // 2, SCREEN_H // 2, (all_sprites, player_group), slot=0)
     em     = EnemyManager(all_sprites)
 
-    remote_players: dict = {}
-    remote_blt_sprites: dict = {}
+    remote_players: dict = {}     # slot -> RemotePlayer
+    remote_blt_sprites: dict = {} # (slot, bid) -> RemoteBullet
 
     _next_bid = 0
 
@@ -91,7 +96,7 @@ async def main():
     lan_server   = None
     lan_client   = None
     local_slot   = 0
-    players_info = []
+    players_info = []   # list of {slot, username, kills, dead, respawn_timer}
     lobby_mode   = None
     join_ip      = ""
     join_cursor_visible = True
@@ -104,17 +109,18 @@ async def main():
     restart_cd_timer  = 0.0
     pending_restart   = False
 
-    # Spectator / respawn
+    # Play-Again ready table (LAN Game Over screen)
+    play_again_ready_players = []   # list of {slot, username} who pressed Play Again
+    play_again_host_ready    = False  # has host themselves pressed Play Again
+    play_again_countdown     = -1   # -1 = not counting, 0-5 = counting down
+    play_again_cd_timer      = 0.0
+    game_over_broadcast_sent = False  # host only: have we sent the game_over packet?
+
+    # Spectator / respawn (LAN)
+    # local player's respawn countdown (-1 = not dead in spectator mode)
     local_respawn_timer = -1.0
+    # remote players' respawn timers: slot -> float seconds remaining
     remote_respawn_timers: dict = {}
-
-    # Post-Game Over ready system (LAN only)
-    postgame_readys = set()
-    post_restart_countdown = -1
-    post_restart_timer = 0.0
-
-    # NEW: prevent death sound from playing every frame
-    _death_sound_played = False
 
     _click_held = False
 
@@ -124,9 +130,8 @@ async def main():
         nonlocal state, elapsed, paused_game_snap, pending_restart
         nonlocal restart_countdown, restart_cd_timer, _next_bid
         nonlocal local_respawn_timer, remote_respawn_timers
-        nonlocal postgame_readys, post_restart_countdown, post_restart_timer
-        nonlocal _death_sound_played
-
+        nonlocal play_again_ready_players, play_again_host_ready
+        nonlocal play_again_countdown, play_again_cd_timer, game_over_broadcast_sent
         all_sprites.empty()
         bullet_group.empty()
         remote_bullets_group.empty()
@@ -136,11 +141,11 @@ async def main():
         _next_bid = 0
         local_respawn_timer = -1.0
         remote_respawn_timers = {}
-        postgame_readys.clear()
-        post_restart_countdown = -1
-        post_restart_timer = 0.0
-        _death_sound_played = False
-
+        play_again_ready_players = []
+        play_again_host_ready    = False
+        play_again_countdown     = -1
+        play_again_cd_timer      = 0.0
+        game_over_broadcast_sent = False
         player.slot = local_slot
         player._load_sprites(local_slot)
         player.image = player.frames["idle"]
@@ -167,6 +172,7 @@ async def main():
         return remote_players[slot]
 
     def _all_player_positions():
+        """(x,y) of all living players for enemy targeting."""
         positions = []
         if not player.is_dead:
             positions.append((player.fx, player.fy))
@@ -212,7 +218,16 @@ async def main():
     def _get_player_info(slot):
         return next((p for p in players_info if p["slot"] == slot), None)
 
+    def _upsert_player_info(slot, **kwargs):
+        p = _get_player_info(slot)
+        if p is None:
+            p = {"slot": slot, "username": f"P{slot+1}", "kills": 0,
+                 "dead": False, "respawn_timer": -1.0}
+            players_info.append(p)
+        p.update(kwargs)
+
     def _all_lan_players_dead():
+        """True only when every player in the session is dead (game over)."""
         if not player.is_dead:
             return False
         for rp in remote_players.values():
@@ -221,6 +236,7 @@ async def main():
         return True
 
     def _any_other_player_alive():
+        """True if at least one other (remote) player is still alive."""
         for rp in remote_players.values():
             if not rp.is_dead:
                 return True
@@ -243,10 +259,14 @@ async def main():
                     players_info, respawn_timers=rtimers)
         sound.draw_crosshair(screen)
 
-        if restart_countdown >= 0:
-            msg = ui.t("restart_countdown", n=restart_countdown)
-            surf = ui._font_small.render(msg, True, (255, 200, 50))
-            screen.blit(surf, surf.get_rect(center=(SCREEN_W // 2, SCREEN_H - 30)))
+        # Restart countdown overlay (host-triggered, visible in PLAYING state)
+        if pending_restart and restart_countdown >= 0:
+            cd_bg = pygame.Surface((SCREEN_W, 70), pygame.SRCALPHA)
+            cd_bg.fill((0, 0, 0, 160))
+            screen.blit(cd_bg, (0, SCREEN_H // 2 - 35))
+            font_l = pygame.font.SysFont("monospace", 52, bold=True)
+            cd_surf = font_l.render(f"Beginning in {restart_countdown}…", True, (255, 210, 50))
+            screen.blit(cd_surf, cd_surf.get_rect(center=(SCREEN_W // 2, SCREEN_H // 2)))
 
     # ── Network helpers ────────────────────────────────────────────────
 
@@ -269,6 +289,7 @@ async def main():
         for slot_int, blist in client_bullets.items():
             all_bullets[str(slot_int)] = blist
 
+        # Sync kill counts into players_info for all players
         for p in players_info:
             s = p["slot"]
             p["kills"] = em.kill_counts[s] if s < len(em.kill_counts) else 0
@@ -276,6 +297,7 @@ async def main():
                          (s != local_slot and remote_players.get(s, None) is not None
                           and remote_players[s].is_dead)
 
+        # Broadcast respawn timers for all clients
         rt_export = {}
         if local_respawn_timer >= 0:
             rt_export[str(local_slot)] = local_respawn_timer
@@ -291,12 +313,10 @@ async def main():
             "remote_players":  client_positions,
             "bullets":         all_bullets,
             "respawn_timers":  rt_export,
-            "game_over":       (state == STATE_DEAD),
         }
         lan_server.push_state(state_snapshot)
 
     def _net_tick_client():
-        nonlocal state
         lan_client.send_pos(player.get_net_state())
         lan_client.send_bullets(_local_bullets_snapshot())
 
@@ -306,9 +326,12 @@ async def main():
 
         if sv.get("type") == "game":
             em.apply_remote_enemies(sv.get("enemies", []), dt)
+
+            # Sync kill counts from host — this fixes clients not seeing others' scores
             kc = sv.get("kill_counts", [])
             em.apply_remote_kill_counts(kc)
 
+            # Update players_info kills from authoritative host kill_counts
             for p in players_info:
                 s = p["slot"]
                 if s < len(kc):
@@ -327,47 +350,20 @@ async def main():
 
             _sync_remote_bullets(sv.get("bullets", {}))
 
+            # Sync respawn timers from host
             rt = sv.get("respawn_timers", {})
+            nonlocal local_respawn_timer
             for slot_str, t in rt.items():
                 slot = int(slot_str)
                 if slot == local_slot:
-                    nonlocal local_respawn_timer
                     local_respawn_timer = float(t)
                 else:
                     remote_respawn_timers[slot] = float(t)
+            # Clear timers for slots not in host broadcast
             for slot in list(remote_respawn_timers.keys()):
                 if str(slot) not in rt and slot != local_slot:
                     del remote_respawn_timers[slot]
 
-            if sv.get("game_over", False):
-                state = STATE_DEAD
-
-        return sv
-
-    def _net_tick_dead_host():
-        for ev in lan_server.get_events():
-            if ev["type"] == "ready_post":
-                postgame_readys.add(ev["slot"])
-            elif ev["type"] == "quit_post":
-                postgame_readys.discard(ev["slot"])
-
-        state_snapshot = {
-            "type":      "postgame",
-            "readys":    list(postgame_readys),
-            "countdown": post_restart_countdown,
-        }
-        lan_server.push_state(state_snapshot)
-
-    def _net_tick_dead_client():
-        nonlocal postgame_readys, post_restart_countdown
-        sv = lan_client.get_state()
-        if not sv:
-            return None
-        if sv.get("type") == "postgame":
-            postgame_readys = set(sv.get("readys", []))
-            post_restart_countdown = sv.get("countdown", -1)
-        elif sv.get("type") == "force_menu":
-            return sv
         return sv
 
     # ── Main loop ──────────────────────────────────────────────────────
@@ -385,6 +381,7 @@ async def main():
                 _click_held = False
 
             if event.type == pygame.MOUSEBUTTONDOWN:
+                # Allow shooting even in spectator (so respawning player is ready)
                 if state == STATE_PLAYING and event.button == 1:
                     if not player.is_dead:
                         bid = nonlocal_next_bid[0]
@@ -423,13 +420,13 @@ async def main():
                         paused_game_snap = None
                         state = STATE_PAUSED
                         sound.set_paused_filter(True)
-                        sound.restore_cursor()
+                        sound.restore_cursor()        # FIX 4: show cursor in pause
                         if not is_lan:
                             sound.stop_steps()
                     elif state == STATE_PAUSED:
                         state = STATE_PLAYING
                         sound.set_paused_filter(False)
-                        sound.set_crosshair()
+                        sound.set_crosshair()         # FIX 4: hide cursor on resume
                         paused_game_snap = None
 
         _next_bid = nonlocal_next_bid[0]
@@ -527,7 +524,8 @@ async def main():
                         merged = [mine] if mine else []
                         for rp in lp:
                             if rp["slot"] != local_slot:
-                                ex = next((p for p in merged if p["slot"] == rp["slot"]), None)
+                                ex = next((p for p in merged
+                                           if p["slot"] == rp["slot"]), None)
                                 if ex:
                                     ex["username"] = rp["username"]
                                 else:
@@ -577,6 +575,7 @@ async def main():
         elif state == STATE_PLAYING:
             elapsed += dt
 
+            # Only update local player if they're alive (or still in dying anim)
             if not player.is_dead:
                 player.update(dt, keys, mouse_pos)
                 moving = any([keys[pygame.K_LEFT], keys[pygame.K_a], keys[pygame.K_q],
@@ -614,13 +613,18 @@ async def main():
             else:
                 em.update(dt, all_pos, bullet_group, all_pls, sound, local_slot)
 
+            # ── Respawn / spectator logic (LAN only) ───────────────────
             if is_lan:
+                # Tick local respawn timer
                 if player.is_dead:
                     if local_respawn_timer < 0:
+                        # FIX 1: check if ALL players are already dead before
+                        # starting a respawn countdown — if so, go straight to game over
                         if not _any_other_player_alive():
                             state = STATE_DEAD
                             sound.stop_bgm(); sound.restore_cursor(); sound.stop_steps()
                         else:
+                            # Start respawn countdown
                             local_respawn_timer = RESPAWN_DELAY
                             sound.stop_bgm()
                             sound.restore_cursor()
@@ -629,15 +633,18 @@ async def main():
                     else:
                         local_respawn_timer = max(0.0, local_respawn_timer - dt)
                         if local_respawn_timer <= 0 and _any_other_player_alive():
+                            # RESPAWN
                             player.respawn(SCREEN_W // 2, SCREEN_H // 2,
                                            RESPAWN_LIVES, RESPAWN_IFRAMES)
                             local_respawn_timer = -1.0
                             sound.play_bgm()
                             sound.set_crosshair()
                         elif local_respawn_timer <= 0 and not _any_other_player_alive():
+                            # Everyone dead — real game over
                             local_respawn_timer = -1.0
                             state = STATE_DEAD
 
+                # Tick remote respawn timers (host only — authoritative)
                 if is_host:
                     for slot, rp in list(remote_players.items()):
                         if rp.is_dead:
@@ -649,21 +656,29 @@ async def main():
                         else:
                             remote_respawn_timers.pop(slot, None)
 
+                    # Send respawn command to clients whose timer hit 0
                     for slot in list(remote_respawn_timers.keys()):
                         if remote_respawn_timers[slot] <= 0:
+                            # Host will send a state packet with respawn_slot
                             lan_server.send_respawn(slot)
                             del remote_respawn_timers[slot]
 
+                # Check all-dead (LAN game over)
                 if _all_lan_players_dead() and local_respawn_timer < 0:
+                    if is_host and not game_over_broadcast_sent:
+                        game_over_broadcast_sent = True
+                        lan_server.broadcast_game_over()
                     state = STATE_DEAD
                     sound.stop_bgm(); sound.restore_cursor(); sound.stop_steps()
 
             else:
+                # Solo: standard death
                 if player.is_dead:
                     state = STATE_DEAD
                     sound.stop_bgm(); sound.restore_cursor(); sound.stop_steps()
                     sound.play("player_death")
 
+            # Countdown for host-triggered restart
             if pending_restart:
                 restart_cd_timer -= dt
                 remaining = max(0, int(restart_cd_timer))
@@ -677,6 +692,7 @@ async def main():
                     _start_game()
                     continue
 
+            # Network tick
             net_tick_timer += dt
             if net_tick_timer >= 1.0 / LAN_TICK_RATE:
                 net_tick_timer = 0.0
@@ -697,7 +713,23 @@ async def main():
                                 local_respawn_timer = -1.0
                                 sound.play_bgm()
                                 sound.set_crosshair()
+                        elif t == "game_over":
+                            state = STATE_DEAD
+                            sound.stop_bgm(); sound.restore_cursor(); sound.stop_steps()
+                        elif t == "quit_to_menu":
+                            if lan_client: lan_client.stop(); lan_client = None
+                            is_lan = False; lobby_mode = None
+                            state = STATE_MENU
+                            sound.stop_bgm(); sound.restore_cursor()
+                            sound.play_menu_bgm()
+                        elif t == "play_again_ready":
+                            play_again_ready_players = sv.get("ready", [])
+                        elif t == "play_again_countdown":
+                            play_again_countdown = sv.get("secs", 5)
+                        elif t == "play_again_start":
+                            _start_game()
 
+            # Sync players_info kills for local slot
             p_local = _get_player_info(local_slot)
             if p_local:
                 p_local["kills"] = em.kill_counts[local_slot]
@@ -760,10 +792,31 @@ async def main():
                                 local_respawn_timer = -1.0
                                 sound.play_bgm()
                                 sound.set_crosshair()
+                            elif t == "game_over":
+                                state = STATE_DEAD
+                                sound.stop_bgm(); sound.restore_cursor()
+                                paused_game_snap = None
+                            elif t == "quit_to_menu":
+                                if lan_client: lan_client.stop(); lan_client = None
+                                is_lan = False; lobby_mode = None
+                                state = STATE_MENU; paused_game_snap = None
+                                sound.set_paused_filter(False)
+                                sound.stop_bgm(); sound.restore_cursor()
+                                sound.play_menu_bgm()
+                            elif t == "play_again_ready":
+                                play_again_ready_players = sv.get("ready", [])
+                            elif t == "play_again_countdown":
+                                play_again_countdown = sv.get("secs", 5)
+                            elif t == "play_again_start":
+                                _start_game()
 
                 if is_lan and _all_lan_players_dead() and local_respawn_timer < 0:
+                    if is_host and not game_over_broadcast_sent:
+                        game_over_broadcast_sent = True
+                        lan_server.broadcast_game_over()
                     state = STATE_DEAD
                     sound.stop_bgm(); sound.restore_cursor()
+                    paused_game_snap = None
 
             if pending_restart:
                 restart_cd_timer -= dt
@@ -783,6 +836,8 @@ async def main():
             if paused_game_snap is None:
                 paused_game_snap = screen.copy()
 
+            # Only show the pause sidebar when NOT counting down (restart countdown
+            # is displayed as a full-screen overlay directly in draw_pause).
             action = ui.draw_pause(screen, paused_game_snap,
                                    is_host=is_host, is_lan=is_lan,
                                    restart_countdown=restart_countdown)
@@ -798,12 +853,14 @@ async def main():
                 elif action == "restart":
                     sound.play_btn()
                     if is_lan and is_host:
+                        # Close pause immediately, go to PLAYING, countdown shown there
                         pending_restart   = True
                         restart_cd_timer  = 5.0
                         restart_countdown = 5
-                        state = STATE_PLAYING
+                        state = STATE_PLAYING       # ← leave pause right away
                         sound.set_paused_filter(False)
                         sound.set_crosshair()
+                        paused_game_snap = None
                         if lan_server:
                             lan_server.broadcast_restart_countdown(5)
                     else:
@@ -815,7 +872,9 @@ async def main():
                     ui.toggle_lang()
                 elif action == "quit":
                     sound.play_btn()
-                    if lan_server: lan_server.stop(); lan_server = None
+                    if is_host and lan_server:
+                        lan_server.broadcast_quit_to_menu()
+                        lan_server.stop(); lan_server = None
                     if lan_client: lan_client.stop(); lan_client = None
                     is_lan = False
                     sound.set_paused_filter(False)
@@ -823,86 +882,105 @@ async def main():
                     state = STATE_MENU; lobby_mode = None
                     paused_game_snap = None
 
-        # ── DEAD (Game Over) ───────────────────────────────────────────
+        # ── DEAD ───────────────────────────────────────────────────────
         elif state == STATE_DEAD:
             screen.blit(bg, (0, 0))
             all_sprites.draw(screen)
 
-            # FIXED: death sound now plays once in LAN (and solo)
-            if not _death_sound_played:
-                sound.play("player_death")
-                sound.stop_bgm()
-                sound.restore_cursor()
-                sound.stop_steps()
-                _death_sound_played = True
+            # ── Host: tick Play-Again countdown ────────────────────────
+            if is_lan and is_host and play_again_countdown >= 0:
+                play_again_cd_timer -= dt
+                remaining = max(0, int(play_again_cd_timer))
+                if play_again_countdown != remaining:
+                    play_again_countdown = remaining
+                    lan_server.broadcast_play_again_countdown(remaining)
+                if play_again_cd_timer <= 0:
+                    # Broadcast the restart then start locally
+                    lan_server.broadcast_restart()
+                    lan_server.clear_play_again_flags()
+                    _start_game()
+                    continue
 
-            if is_lan:
-                if post_restart_countdown >= 0:
-                    post_restart_timer -= dt
-                    remaining = max(0, int(post_restart_timer))
-                    if post_restart_countdown != remaining:
-                        post_restart_countdown = remaining
-                    if post_restart_timer <= 0:
+            # ── Host: collect incoming play_again events ───────────────
+            if is_lan and is_host and lan_server:
+                for ev in lan_server.get_events():
+                    if ev["type"] == "play_again":
+                        # Rebuild ready list from server
+                        play_again_ready_players = lan_server.get_play_again_clients()
+                        # Add host too if already ready
+                        if play_again_host_ready:
+                            host_entry = {"slot": 0, "username": players_info[0]["username"]
+                                          if players_info else "Host"}
+                            if not any(r["slot"] == 0 for r in play_again_ready_players):
+                                play_again_ready_players = [host_entry] + play_again_ready_players
+                        lan_server.broadcast_play_again_ready(play_again_ready_players)
+
+            # ── Client: poll for play_again_ready / countdown / restart ─
+            if is_lan and lan_client and lan_client.connected:
+                sv = lan_client.get_state()
+                if sv:
+                    t = sv.get("type")
+                    if t == "play_again_ready":
+                        play_again_ready_players = sv.get("ready", [])
+                    elif t == "play_again_countdown":
+                        play_again_countdown = sv.get("secs", 5)
+                    elif t == "restart":
                         _start_game()
                         continue
+                    elif t == "quit_to_menu":
+                        if lan_client: lan_client.stop(); lan_client = None
+                        is_lan = False; lobby_mode = None
+                        state = STATE_MENU
+                        sound.stop_bgm(); sound.restore_cursor()
+                        sound.play_menu_bgm()
+                        continue
 
-                net_tick_timer += dt
-                if net_tick_timer >= 1.0 / LAN_TICK_RATE:
-                    net_tick_timer = 0.0
-                    if is_host:
-                        _net_tick_dead_host()
-                    elif lan_client and lan_client.connected:
-                        sv = _net_tick_dead_client()
-                        if sv and sv.get("type") == "force_menu":
-                            state = STATE_MENU
-                            if lan_client:
-                                lan_client.stop()
-                                lan_client = None
-                            is_lan = False
-                            lobby_mode = None
-                            sound.play_menu_bgm()
-                            _death_sound_played = False
-                            continue
-
-            action = ui.draw_death(screen, elapsed, em.kill_counts, players_info,
-                                   is_lan=is_lan, is_host=is_host,
-                                   ready_slots=list(postgame_readys),
-                                   post_countdown=post_restart_countdown)
+            action = ui.draw_death(
+                screen, elapsed, em.kill_counts, players_info,
+                is_lan=is_lan, is_host=is_host,
+                ready_players=play_again_ready_players if is_lan else None,
+                play_again_countdown=play_again_countdown,
+            )
 
             if clicked:
                 _click_held = True
-                if action in ("play_again", "retry"):
+                if action == "retry":
                     sound.play_btn()
                     if not is_lan:
+                        # Solo: just restart
                         _start_game()
+                    elif is_host:
+                        # Host pressed Play Again: mark host as ready, start countdown
+                        play_again_host_ready = True
+                        host_name = players_info[0]["username"] if players_info else "Host"
+                        host_entry = {"slot": 0, "username": host_name}
+                        if not any(r["slot"] == 0 for r in play_again_ready_players):
+                            play_again_ready_players = [host_entry] + play_again_ready_players
+                        # Also include any clients already ready
+                        play_again_ready_players = [host_entry] + \
+                            lan_server.get_play_again_clients()
+                        lan_server.broadcast_play_again_ready(play_again_ready_players)
+                        # Start 5-second countdown
+                        play_again_countdown = 5
+                        play_again_cd_timer  = 5.0
+                        lan_server.broadcast_play_again_countdown(5)
                     else:
-                        postgame_readys.add(local_slot)
-                        if is_host:
-                            if post_restart_countdown < 0:
-                                post_restart_timer = 5.0
-                                post_restart_countdown = 5
-                        else:
-                            if lan_client and lan_client.connected:
-                                lan_client.send_ready_post()
+                        # Client pressed Play Again: tell host
+                        if lan_client: lan_client.send_play_again()
+
                 elif action == "quit":
                     sound.play_btn()
-                    if is_lan:
-                        if is_host:
-                            if lan_server:
-                                lan_server.broadcast_force_menu()
-                            lan_server.stop()
-                            lan_server = None
-                            is_lan = False
-                        else:
-                            if lan_client:
-                                lan_client.send_quit_post()
-                                lan_client.stop()
-                                lan_client = None
-                            is_lan = False
-                        lobby_mode = None
-                    state = STATE_MENU
+                    if is_host and lan_server:
+                        # Host quits → everyone goes to menu
+                        lan_server.broadcast_quit_to_menu()
+                        lan_server.stop(); lan_server = None
+                    elif lan_client:
+                        # Client quits → only this client leaves
+                        lan_client.stop(); lan_client = None
+                    is_lan = False
+                    state = STATE_MENU; lobby_mode = None
                     sound.play_menu_bgm()
-                    _death_sound_played = False
+
                 elif action == "lang":
                     sound.play_btn()
                     ui.toggle_lang()
