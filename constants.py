@@ -49,12 +49,17 @@ WALK_ANIM_SPEED = 0.15
 DEATH_DURATION  = 0.8
 
 # --- Game states ---
-STATE_MENU     = "menu"
-STATE_USERNAME = "username"
-STATE_LOBBY    = "lobby"
-STATE_PLAYING  = "playing"
-STATE_DEAD     = "dead"
-STATE_PAUSED   = "paused"
+STATE_MENU      = "menu"
+STATE_USERNAME  = "username"
+STATE_LOBBY     = "lobby"
+STATE_PLAYING   = "playing"
+STATE_DEAD      = "dead"
+STATE_PAUSED    = "paused"
+
+# --- Respawn (LAN) ---
+RESPAWN_DELAY   = 30.0   # seconds before a dead LAN player respawns
+RESPAWN_LIVES   = 1      # HP on respawn
+RESPAWN_IFRAMES = 3.0    # seconds of invulnerability on respawn
 
 # --- Languages ---
 LANGUAGES    = ["en", "fr"]
@@ -74,11 +79,15 @@ SOUNDS_DIR  = os.path.join(ASSETS_DIR, "sounds")
 CURSORS_DIR = os.path.join(ASSETS_DIR, "cursors")
 LOCALES_DIR = os.path.join(BASE_DIR,  "locales")
 
+# --- Map texture ---
+# Drop a 16:9 PNG named "map.png" into the assets/ folder.
+# It will be auto-scaled to fill the arena (1280x720).
+# If absent, a dark procedural grid is drawn instead.
+MAP_IMG_PATH = os.path.join(ASSETS_DIR, "map.png")
+
 # --- Player sprite naming convention ---
-# Player 1: Player_idle.png, Player_w-1.png, Player_w-2.png, Player_Dead.png
-# Player N: Player_idle_N.png, Player_w-1_N.png, Player_w-2_N.png, Player_Dead_N.png
 PLAYER_SPRITE_SUFFIX = {
-    0: "",    # slot 0 / player 1 -> no suffix
+    0: "",
     1: "_2",
     2: "_3",
     3: "_4",
